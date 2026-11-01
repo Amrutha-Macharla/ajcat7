@@ -13,9 +13,9 @@ const DEFAULT_WHATSAPP_NUMBER = "919492443916";
 const DEFAULT_CLOUDINARY_NAME = "do2kiuqp4";
 const DEFAULT_CLOUDINARY_PRESET = "ml_default";
 
-// Auto-migrate legacy localStorage defaults
-if (localStorage.getItem('aj_firebase_url') === "https://ajcat5-default-rtdb.asia-southeast1.firebasedatabase.app" ||
-    localStorage.getItem('aj_firebase_url') === "https://ajcat6-ed24d-default-rtdb.asia-southeast1.firebasedatabase.app") {
+// Auto-migrate legacy localStorage defaults and clean trailing slashes
+let storedUrl = localStorage.getItem('aj_firebase_url');
+if (!storedUrl || storedUrl.includes('ajcat5') || storedUrl.includes('ajcat6') || storedUrl.endsWith('/') || storedUrl !== DEFAULT_FIREBASE_URL) {
     localStorage.setItem('aj_firebase_url', DEFAULT_FIREBASE_URL);
 }
 if (localStorage.getItem('aj_cloudinary_name') === "agc6iqec" ||
@@ -63,6 +63,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     lucide.createIcons();
 });
 
+// Auto-sync from Firebase whenever user focuses or switches back to tab
+window.addEventListener('focus', async () => {
+    if (state.firebaseUrl) {
+        const synced = await trySyncFromFirebase();
+        if (synced) {
+            recalculateAllProductsInState();
+            renderAll();
+        }
+    }
+});
+
 async function loadInitialData() {
     try {
         // Load settings from local backend if available
@@ -71,30 +82,70 @@ async function loadInitialData() {
             if (settingsRes.settings.cipher) {
                 try { state.cipher = JSON.parse(settingsRes.settings.cipher); } catch (e) {}
             }
-            if (settingsRes.settings.firebase_url) state.firebaseUrl = settingsRes.settings.firebase_url;
+            if (settingsRes.settings.firebase_url) {
+                state.firebaseUrl = settingsRes.settings.firebase_url.trim().replace(/\/+$/, '');
+                localStorage.setItem('aj_firebase_url', state.firebaseUrl);
+            }
             if (settingsRes.settings.cloudinary_name) state.cloudinaryName = settingsRes.settings.cloudinary_name;
             if (settingsRes.settings.cloudinary_preset) state.cloudinaryPreset = settingsRes.settings.cloudinary_preset;
             if (settingsRes.settings.whatsapp_number) state.whatsappNumber = settingsRes.settings.whatsapp_number;
         }
 
-        // Sync strictly and completely from connected Firebase Realtime Database
+        // 1. Sync strictly and completely from connected Firebase Realtime Database
+        let firebaseSyncSuccess = false;
         if (state.firebaseUrl) {
-            await trySyncFromFirebase();
-        } else {
-            // Local fallback only if Firebase URL is not configured
-            const [ratesRes, catsRes, prodsRes] = await Promise.all([
-                fetch('/api/rates').then(r => r.json()).catch(() => ({ success: false })),
-                fetch('/api/categories').then(r => r.json()).catch(() => ({ success: false })),
-                fetch('/api/products').then(r => r.json()).catch(() => ({ success: false }))
-            ]);
-
-            if (ratesRes.success && ratesRes.rates && ratesRes.rates.length > 0) state.rates = ratesRes.rates;
-            if (catsRes.success && catsRes.categories) state.categories = catsRes.categories;
-            if (prodsRes.success && prodsRes.products) state.products = prodsRes.products;
+            firebaseSyncSuccess = await trySyncFromFirebase();
         }
 
-        // Ensure default rates exist if rates are missing
+        // 2. If products, categories, or rates are empty in state (e.g. Firebase is brand new or offline), fallback to local SQLite
+        if (!state.categories || state.categories.length === 0) {
+            const catsRes = await fetch('/api/categories').then(r => r.json()).catch(() => ({ success: false }));
+            if (catsRes.success && catsRes.categories && catsRes.categories.length > 0) {
+                state.categories = catsRes.categories;
+            }
+        }
+        if (!state.products || state.products.length === 0) {
+            const prodsRes = await fetch('/api/products').then(r => r.json()).catch(() => ({ success: false }));
+            if (prodsRes.success && prodsRes.products && prodsRes.products.length > 0) {
+                state.products = prodsRes.products;
+            }
+        }
+        if (!state.rates || state.rates.length === 0) {
+            const ratesRes = await fetch('/api/rates').then(r => r.json()).catch(() => ({ success: false }));
+            if (ratesRes.success && ratesRes.rates && ratesRes.rates.length > 0) {
+                state.rates = ratesRes.rates;
+            }
+        }
+
+        // 3. Fallback defaults if still empty
         if (!state.rates || state.rates.length === 0) state.rates = [...DEFAULT_RATES];
+        if (!state.categories || state.categories.length === 0) {
+            state.categories = [
+                { id: 'cat_gold_black_beads', name: 'Gold Black Beads', icon_letter: 'G' },
+                { id: 'cat_1_gram_gold_earrings', name: '1 Gram Gold Earrings', icon_letter: '1' },
+                { id: 'cat_18_ct_chains', name: '18 Ct Chains', icon_letter: '1' },
+                { id: 'cat_gold_mattilu', name: 'Gold Mattilu', icon_letter: 'G' },
+                { id: 'cat_gold_thalli_chains', name: 'Gold Thalli Chains', icon_letter: 'G' },
+                { id: 'cat_diamond_jewellery', name: 'Diamond Jewellery', icon_letter: 'D' },
+                { id: 'cat_silver_articles', name: 'Silver Articles', icon_letter: 'S' }
+            ];
+        }
+
+        // 4. Ensure every product's category exists in state.categories
+        state.products.forEach(p => {
+            if (p.category_id && !state.categories.some(c => c.id === p.category_id)) {
+                state.categories.push({
+                    id: p.category_id,
+                    name: p.category_name || 'General',
+                    icon_letter: (p.category_name || 'G')[0].toUpperCase()
+                });
+            }
+        });
+
+        // 5. If Firebase is connected and completely empty, auto-seed it with the categories & rates
+        if (state.firebaseUrl && firebaseSyncSuccess && state.firebaseCategoriesEmpty) {
+            syncWithFirebaseNow().catch(() => {});
+        }
 
         // Dynamically recalculate all product prices with current rates
         recalculateAllProductsInState();
@@ -106,32 +157,79 @@ async function loadInitialData() {
 }
 
 async function trySyncFromFirebase() {
-    if (!state.firebaseUrl) return;
-    const cleanUrl = state.firebaseUrl.replace(/\/+$/, '');
+    if (!state.firebaseUrl) return false;
+    const cleanUrl = state.firebaseUrl.trim().replace(/\/+$/, '');
+
+    const fetchJson = async (endpoint) => {
+        try {
+            const res = await fetch(`${cleanUrl}${endpoint}`);
+            if (res.status === 401) return { _error: '401' };
+            if (!res.ok) return null;
+            const data = await res.json();
+            if (data && data.error && typeof data.error === 'string') return { _error: data.error };
+            return data;
+        } catch (e) {
+            return { _networkError: true };
+        }
+    };
+
     try {
         const [fbRates, fbCats, fbProds, fbSettings] = await Promise.all([
-            fetch(`${cleanUrl}/rates.json`).then(r => r.json()).catch(() => null),
-            fetch(`${cleanUrl}/categories.json`).then(r => r.json()).catch(() => null),
-            fetch(`${cleanUrl}/products.json`).then(r => r.json()).catch(() => null),
-            fetch(`${cleanUrl}/settings.json`).then(r => r.json()).catch(() => null)
+            fetchJson('/rates.json'),
+            fetchJson('/categories.json'),
+            fetchJson('/products.json'),
+            fetchJson('/settings.json')
         ]);
 
-        // PRODUCTS: Strictly and completely from Firebase
-        if (fbProds && typeof fbProds === 'object') {
-            state.products = Array.isArray(fbProds)
-                ? fbProds.filter(Boolean)
-                : Object.entries(fbProds).map(([key, val]) => ({ ...val, id: val.id || key }));
+        const isPermissionDenied = [fbRates, fbCats, fbProds, fbSettings].some(r => r && r._error === '401');
+        const hasNetworkError = [fbRates, fbCats, fbProds, fbSettings].some(r => r && r._networkError);
+        const statusEl = document.getElementById('firebase-sync-status');
+        const alertBanner = document.getElementById('firebase-permission-banner');
+
+        if (isPermissionDenied) {
+            console.warn("Firebase Realtime Database: 401 Permission Denied. Rules must allow read access.");
+            if (statusEl) {
+                statusEl.innerHTML = `<span class="text-rose-600 font-bold flex items-center gap-1"><i data-lucide="alert-triangle" class="w-3.5 h-3.5 inline"></i> Rules Locked (401)</span>`;
+            }
+            if (alertBanner) {
+                alertBanner.classList.remove('hidden');
+            }
+            lucide.createIcons();
+            return false;
+        } else if (hasNetworkError) {
+            if (statusEl) {
+                statusEl.innerHTML = `<span class="text-amber-600 font-medium flex items-center gap-1"><i data-lucide="wifi-off" class="w-3.5 h-3.5 inline"></i> Connecting / Offline</span>`;
+            }
+            if (alertBanner) {
+                alertBanner.classList.add('hidden');
+            }
+            return false;
         } else {
-            state.products = [];
+            if (statusEl) {
+                statusEl.innerHTML = `<span class="text-emerald-700 font-medium flex items-center gap-1"><i data-lucide="check-circle" class="w-3.5 h-3.5 inline"></i> Connected</span>`;
+            }
+            if (alertBanner) {
+                alertBanner.classList.add('hidden');
+            }
         }
 
-        // CATEGORIES: Strictly from Firebase, or derived from Firebase products
-        if (fbCats && typeof fbCats === 'object') {
-            state.categories = Array.isArray(fbCats)
+        // Track whether Firebase categories are currently empty
+        state.firebaseCategoriesEmpty = (!fbCats || (typeof fbCats === 'object' && Object.keys(fbCats).length === 0));
+
+        // PRODUCTS: From Firebase if present
+        if (fbProds && typeof fbProds === 'object' && !fbProds._error && !fbProds._networkError) {
+            const list = Array.isArray(fbProds)
+                ? fbProds.filter(Boolean)
+                : Object.entries(fbProds).map(([key, val]) => ({ ...val, id: val.id || key }));
+            state.products = list;
+        }
+
+        // CATEGORIES: From Firebase if present
+        if (fbCats && typeof fbCats === 'object' && !fbCats._error && !fbCats._networkError) {
+            const list = Array.isArray(fbCats)
                 ? fbCats.filter(Boolean)
                 : Object.entries(fbCats).map(([key, val]) => ({ ...val, id: val.id || key }));
-        } else {
-            state.categories = [];
+            state.categories = list;
         }
 
         // If categories are empty in Firebase, derive them from Firebase products
@@ -152,7 +250,7 @@ async function trySyncFromFirebase() {
         }
 
         // RATES: From Firebase if present
-        if (fbRates && typeof fbRates === 'object') {
+        if (fbRates && typeof fbRates === 'object' && !fbRates._error && !fbRates._networkError) {
             const list = Array.isArray(fbRates)
                 ? fbRates.filter(Boolean)
                 : Object.entries(fbRates).map(([key, val]) => ({ ...val, id: val.id || key }));
@@ -160,7 +258,7 @@ async function trySyncFromFirebase() {
         }
 
         // SETTINGS: From Firebase if present
-        if (fbSettings && typeof fbSettings === 'object') {
+        if (fbSettings && typeof fbSettings === 'object' && !fbSettings._error && !fbSettings._networkError) {
             if (fbSettings.cipher) {
                 try { state.cipher = typeof fbSettings.cipher === 'string' ? JSON.parse(fbSettings.cipher) : fbSettings.cipher; } catch(e){}
             }
@@ -168,8 +266,11 @@ async function trySyncFromFirebase() {
             if (fbSettings.cloudinary_name) state.cloudinaryName = fbSettings.cloudinary_name;
             if (fbSettings.cloudinary_preset) state.cloudinaryPreset = fbSettings.cloudinary_preset;
         }
+
+        return true;
     } catch (e) {
         console.warn("Firebase check:", e);
+        return false;
     }
 }
 
@@ -1373,7 +1474,7 @@ function resetDefaultCipher() {
 // ==========================================
 async function handleSaveCloudSettings(e) {
     e.preventDefault();
-    const firebaseUrl = document.getElementById('cloud-firebase-url').value.trim();
+    const firebaseUrl = document.getElementById('cloud-firebase-url').value.trim().replace(/\/+$/, '');
     const cloudinaryName = document.getElementById('cloud-cloudinary-name').value.trim();
     const cloudinaryPreset = document.getElementById('cloud-cloudinary-preset').value.trim();
     const cloudinaryKey = document.getElementById('cloud-cloudinary-key').value.trim();

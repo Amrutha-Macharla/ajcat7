@@ -326,6 +326,8 @@ class CatalogueHTTPHandler(BaseHTTPRequestHandler):
             mime, _ = mimetypes.guess_type(file_path)
             self.send_response(200)
             self.send_header('Content-Type', mime or 'text/html')
+            if clean_path.endswith('.html') or clean_path.endswith('.js'):
+                self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
             self.end_headers()
             with open(file_path, 'rb') as f:
                 self.wfile.write(f.read())
@@ -336,6 +338,7 @@ class CatalogueHTTPHandler(BaseHTTPRequestHandler):
         if os.path.isfile(index_file):
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
+            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
             self.end_headers()
             with open(index_file, 'rb') as f:
                 self.wfile.write(f.read())
