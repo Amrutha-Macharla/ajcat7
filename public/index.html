@@ -614,9 +614,9 @@
 
             <!-- Modal Body (Image + Details) -->
             <div class="flex-1 overflow-y-auto p-6 grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
-                <!-- Large Image (Edge-to-Edge) -->
-                <div class="rounded-2xl overflow-hidden bg-slate-950 flex items-center justify-center max-h-[60vh] aspect-square shadow-inner">
-                    <img id="lightbox-img" src="" class="max-h-[60vh] w-full object-contain">
+                <!-- Large Image (Full Dimensions) -->
+                <div class="rounded-2xl overflow-hidden bg-slate-950 flex items-center justify-center min-h-[250px] max-h-[75vh] w-full shadow-inner p-2">
+                    <img id="lightbox-img" src="" class="max-h-[72vh] w-auto max-w-full object-contain rounded-xl">
                 </div>
 
                 <!-- Product Details Box -->
@@ -697,6 +697,6 @@
     </div>
 
     <!-- Core App Logic -->
-    <script src="app.js?v=2.1"></script>
+    <script src="app.js?v=2.2"></script>
 </body>
 </html>
